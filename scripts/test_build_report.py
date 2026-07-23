@@ -123,6 +123,68 @@ def test_no_external_resource_references_in_output(tmp_path):
         assert forbidden not in html
 
 
+def test_visual_report_shell_promotes_first_heading_to_hero(tmp_path):
+    mod = _module()
+    md_path = _write_markdown(
+        tmp_path,
+        "# 환자별 사망확률 분석\n\n"
+        "보고서 도입 문장입니다.\n\n"
+        "## 의사결정 요약\n\n"
+        "조건부 준비\n",
+    )
+    out_path = tmp_path / "report.html"
+
+    result = mod.build_html_report(str(md_path), str(out_path), title="브라우저 제목")
+
+    assert result["status"] == "ok"
+    html = out_path.read_text(encoding="utf-8")
+    assert '<header class="report-hero">' in html
+    assert '<p class="report-eyebrow">ANALYTICA · DECISION REPORT</p>' in html
+    assert '<h1 class="report-title">환자별 사망확률 분석</h1>' in html
+    assert html.count("환자별 사망확률 분석") == 1
+    assert "<title>브라우저 제목</title>" in html
+
+
+def test_visual_report_shell_wraps_h2_sections_as_numbered_cards(tmp_path):
+    mod = _module()
+    md_path = _write_markdown(
+        tmp_path,
+        "# 분석 보고서\n\n"
+        "## 의사결정 요약\n\n"
+        "- 첫 번째 판단\n- 두 번째 판단\n\n"
+        "## 품질 scorecard\n\n"
+        "| 항목 | 상태 |\n| --- | --- |\n| 결측 | 주의 |\n",
+    )
+    out_path = tmp_path / "report.html"
+
+    result = mod.build_html_report(str(md_path), str(out_path), title="분석 보고서")
+
+    assert result["status"] == "ok"
+    html = out_path.read_text(encoding="utf-8")
+    assert html.count('<section class="report-section') == 2
+    assert '<section class="report-section report-section--summary">' in html
+    assert '<span class="section-index">01</span>' in html
+    assert '<span class="section-index">02</span>' in html
+    assert '<main class="report-main">' in html
+
+
+def test_visual_report_css_uses_responsive_offline_design_tokens(tmp_path):
+    mod = _module()
+    md_path = _write_markdown(tmp_path, "# 제목\n\n## 요약\n\n본문\n")
+    out_path = tmp_path / "report.html"
+
+    result = mod.build_html_report(str(md_path), str(out_path), title="제목")
+
+    assert result["status"] == "ok"
+    html = out_path.read_text(encoding="utf-8")
+    assert "--blue: #3e6ae1;" in html
+    assert "--carbon: #171a20;" in html
+    assert "@media (max-width: 720px)" in html
+    assert "@media print" in html
+    assert "<script" not in html
+    assert "<link " not in html
+
+
 def test_missing_markdown_path_returns_error(tmp_path):
     mod = _module()
     missing_path = tmp_path / "missing.md"
