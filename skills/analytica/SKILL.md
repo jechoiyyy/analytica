@@ -46,25 +46,15 @@ sample [{<column>: <value>}]
 ```bash
 .venv/bin/python analytica/scripts/profile_data.py <path> \
   [--sample-threshold <int>] \
-  [--key-columns <column1,column2,...>]
+  [--key-columns <column1,column2,...>] \
+  [--target <column>] \
+  [--time-column <column>]
 ```
 
 - `--sample-threshold`: 이 행 수를 초과하면 고정 난수 42로 샘플링한다. 기본값 500000
 - `--key-columns`: 중복 키를 판단할 컬럼의 쉼표 구분 목록
-
-현재 CLI에는 `--target`과 `--time-column` 옵션이 없다. 존재하지 않는 CLI 인자를 만들어 사용하지 않는다. 인터뷰의 타깃과 시간 컬럼을 전달해야 할 때는 같은 파일의 실제 공개 함수 API를 호출한다.
-
-```python
-profile_data(
-    path,
-    sample_threshold=500_000,
-    key_columns=None,
-    target="<target 또는 None>",
-    time_column="<time_column 또는 None>",
-)
-```
-
-공개 함수의 반환 dict를 `json.dumps(..., ensure_ascii=False, indent=2)`로 표준 출력에 기록해 다음 단계의 JSON 계약으로 사용한다.
+- `--target`: 타깃 관계와 클래스 균형을 분석할 컬럼
+- `--time-column`: 월별·요일별 시간 패턴을 분석할 날짜 컬럼
 
 성공 JSON:
 
@@ -242,7 +232,7 @@ status, out_path, embedded_charts, warnings
 
 ### [2] 프로파일링과 품질 진단
 
-1. `profile_data.py`의 `profile_data()` 공개 함수에 인터뷰에서 확정한 `target`, `time_column`, 필요하면 데이터 단위의 키 컬럼을 전달한다. CLI에 존재하지 않는 `--target`, `--time-column`을 사용하지 않는다.
+1. `profile_data.py` CLI에 인터뷰에서 확정한 `--target`, `--time-column`, 필요하면 데이터 단위의 `--key-columns`를 전달한다.
 2. 50만 행을 초과해 `sampled=true`이면 `rows_analyzed`와 함께 샘플링 기반 결과임을 이후 보고서에 명시한다.
 3. 다음 JSON을 해석한다.
    - `data_dictionary`: 타입, 고유값, 결측, 샘플값
@@ -264,11 +254,12 @@ status, out_path, embedded_charts, warnings
 4. 컬럼이 예측 시점 이후에만 생성되는지는 데이터만으로 확정하지 않는다. `[현업 확인 필요]`로 표시하고 예측 시점에 조회 가능한지 묻는다.
 5. 사용자 확인과 프로파일링 JSON에 따라 `plan.json`을 만든다.
    - 결측 대체·이상치 처리는 타입, 비율, 분포, 업무 의미를 근거로 선택한다.
+   - `median`과 `mode`는 분석용 `cleaned.csv`를 만들기 위해 제공된 전체 데이터에서 계산하는 의도적 편의 처리임을 기록한다.
    - 범주 매핑은 관찰된 공백·대소문자·오탈자만 명시적으로 적는다.
    - 날짜 파생변수는 인터뷰에서 확인한 시간 의미에 맞게 선택한다.
    - 비즈니스 파생변수는 관찰 가능한 컬럼 조합과 도메인 가설을 함께 적고 `[도메인 지식 추정]`으로 표시한다.
    - 스케일링과 원-핫 인코딩은 `future_pipeline_columns`에만 기록한다.
-   - 분리 후 fit해야 하는 통계적 처리를 전체 데이터에 미리 fit하지 않는다.
+   - cleaned.csv를 모델 학습 입력으로 그대로 재사용하지 않는다. 모델 검증·학습은 원본 데이터를 먼저 train/test 분리한 뒤 결측 대체·스케일링·인코딩을 학습 데이터에 다시 fit하는 Pipeline으로 수행한다.
 6. `apply_preprocess.py <원본> --plan <plan.json> --out <작업 디렉터리>`를 실행한다.
 7. `cleaned_path`, `preprocess_script_path`, 전후 shape, `applied_actions`, `warnings`를 확인하고 처리 이유와 경고를 보고서에 기록한다.
 
@@ -294,6 +285,7 @@ status, out_path, embedded_charts, warnings
    - 품질 진단 전체: 결측, 중복, 이상치, 범주, 분포, 상관, 시간, 그룹, 불균형
    - 누출 점검과 처리 계획
    - 전처리 적용 내역과 원본 보존·재현 방법
+   - `cleaned.csv`는 분석용 산출물이며, 모델 검증·학습에는 원본을 먼저 분리한 뒤 학습 데이터에 fit한 Pipeline을 사용해야 한다는 제한
    - 도메인 인사이트: 유의점, 중요 변수 후보, 파생변수 제안
    - 분리·교차검증, baseline 모델, 평가지표 권고
    - 액션 전략
