@@ -207,5 +207,170 @@ def test_cli_accepts_key_columns_argument(tmp_path, capsys):
     assert captured["duplicates"]["duplicate_key_count"] == 1
 
 
+def test_correlation_high_pairs_detected_without_target(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "corr.csv"
+    a = list(range(1, 11))
+    b = [v * 2 for v in a]
+    c = [10, 1, 7, 3, 9, 2, 8, 4, 6, 5]
+    lines = ["a,b,c"] + [f"{x},{y},{z}" for x, y, z in zip(a, b, c)]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path))
+
+    assert result["status"] == "ok"
+    pairs = result["correlation"]["high_correlation_pairs"]
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert {pair["column_a"], pair["column_b"]} == {"a", "b"}
+    assert pair["correlation"] == pytest.approx(1.0)
+
+
+def test_target_relationship_is_null_without_target(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "basic.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path))
+
+    assert result["target_relationship"] is None
+
+
+def test_target_relationship_computes_numeric_and_categorical_and_class_balance(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "target.csv"
+    target = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
+    feature_num = [1, 2, 1, 2, 1, 9, 10, 9, 10, 9]
+    feature_cat = ["A", "A", "A", "A", "A", "B", "B", "B", "B", "B"]
+    lines = ["target,feature_num,feature_cat"] + [
+        f"{t},{n},{c}" for t, n, c in zip(target, feature_num, feature_cat)
+    ]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), target="target")
+
+    rel = result["target_relationship"]
+    assert rel["target"] == "target"
+
+    num_corr = _find(rel["numeric_correlations"], "feature_num")
+    assert num_corr["correlation"] > 0.9
+
+    cat_group = _find(rel["categorical_group_differences"], "feature_cat")
+    group_a = next(g for g in cat_group["group_means"] if g["category"] == "A")
+    group_b = next(g for g in cat_group["group_means"] if g["category"] == "B")
+    assert group_a["mean_target"] == pytest.approx(0.0)
+    assert group_a["count"] == 5
+    assert group_b["mean_target"] == pytest.approx(1.0)
+    assert group_b["count"] == 5
+
+    assert rel["class_balance"] is not None
+    classes = {c["value"]: c for c in rel["class_balance"]["classes"]}
+    assert classes[0]["count"] == 5
+    assert classes[0]["ratio"] == pytest.approx(0.5)
+    assert classes[1]["count"] == 5
+    assert classes[1]["ratio"] == pytest.approx(0.5)
+
+
+def test_target_relationship_class_balance_null_for_continuous_target(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "continuous_target.csv"
+    rows = "\n".join(f"{i},{i * 2}" for i in range(1, 21))
+    csv_path.write_text(f"target,feature\n{rows}\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), target="target")
+
+    assert result["target_relationship"]["class_balance"] is None
+
+
+def test_target_not_found_returns_error(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "basic.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), target="missing_target")
+
+    assert result["status"] == "error"
+    assert result["error"]["reason"]
+    assert result["error"]["hint"]
+
+
+def test_time_pattern_is_null_without_time_column(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "basic.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path))
+
+    assert result["time_pattern"] is None
+
+
+def test_time_pattern_monthly_and_day_of_week_with_target(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "timepattern.csv"
+    dates = [f"2024-01-{day:02d}" for day in range(1, 11)]
+    target = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    lines = ["date,target"] + [f"{d},{t}" for d, t in zip(dates, target)]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), time_column="date", target="target")
+
+    tp = result["time_pattern"]
+    assert tp["column"] == "date"
+
+    assert len(tp["monthly"]) == 1
+    month_entry = tp["monthly"][0]
+    assert month_entry["month"] == "2024-01"
+    assert month_entry["count"] == 10
+    assert month_entry["mean_target"] == pytest.approx(55.0)
+
+    monday = next(d for d in tp["day_of_week"] if d["day"] == "Monday")
+    assert monday["count"] == 2
+    assert monday["mean_target"] == pytest.approx(45.0)
+
+    thursday = next(d for d in tp["day_of_week"] if d["day"] == "Thursday")
+    assert thursday["count"] == 1
+    assert thursday["mean_target"] == pytest.approx(40.0)
+
+    total_days = sum(d["count"] for d in tp["day_of_week"])
+    assert total_days == 10
+
+
+def test_time_pattern_omits_mean_target_without_target(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "timepattern_notarget.csv"
+    dates = [f"2024-01-{day:02d}" for day in range(1, 6)]
+    lines = ["date,value"] + [f"{d},{i}" for i, d in enumerate(dates)]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), time_column="date")
+
+    tp = result["time_pattern"]
+    assert "mean_target" not in tp["monthly"][0]
+    assert "mean_target" not in tp["day_of_week"][0]
+
+
+def test_time_column_not_found_returns_error(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "basic.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), time_column="not_a_column")
+
+    assert result["status"] == "error"
+    assert result["error"]["reason"]
+    assert result["error"]["hint"]
+
+
+def test_time_column_unparseable_returns_error(tmp_path):
+    mod = _module()
+    csv_path = tmp_path / "badtime.csv"
+    csv_path.write_text("date,value\nnot-a-date,1\nalso-bad,2\n", encoding="utf-8")
+
+    result = mod.profile_data(str(csv_path), time_column="date")
+
+    assert result["status"] == "error"
+    assert "날짜로 해석할 수 없는 값이 포함되어 있습니다" in result["error"]["hint"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

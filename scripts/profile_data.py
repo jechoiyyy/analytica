@@ -36,7 +36,27 @@ JSON-호환 dict로 반환한다. 통계 계산만 수행하며 해석·서술�
     {"name": str, "has_leading_trailing_whitespace": bool,
      "case_variant_groups": [[str, ...], ...],
      "rare_categories": [{"value": str, "count": int}]}
-  ]
+  ],
+  "correlation": {
+    "high_correlation_pairs": [
+      {"column_a": str, "column_b": str, "correlation": float}
+    ]
+  },
+  "target_relationship": {
+    "target": str,
+    "numeric_correlations": [{"name": str, "correlation": float}],
+    "categorical_group_differences": [
+      {"name": str, "group_means": [
+        {"category": str, "mean_target": float, "count": int}
+      ]}
+    ],
+    "class_balance": {"classes": [{"value": Any, "count": int, "ratio": float}]} | null
+  } | null,
+  "time_pattern": {
+    "column": str,
+    "monthly": [{"month": str, "count": int, "mean_target": float}],
+    "day_of_week": [{"day": str, "count": int, "mean_target": float}]
+  } | null
 }
 
 출력 JSON 스키마 (실패):
@@ -201,10 +221,140 @@ def _build_categorical_issues(df: pd.DataFrame) -> list:
     return entries
 
 
+def _build_correlation(df: pd.DataFrame) -> dict:
+    numeric_columns = list(df.select_dtypes(include=[np.number]).columns)
+    pairs = []
+    if len(numeric_columns) >= 2:
+        corr_matrix = df[numeric_columns].corr()
+        for i, column_a in enumerate(numeric_columns):
+            for column_b in numeric_columns[i + 1 :]:
+                value = corr_matrix.loc[column_a, column_b]
+                if pd.isna(value) or abs(value) <= 0.9:
+                    continue
+                pairs.append(
+                    {
+                        "column_a": str(column_a),
+                        "column_b": str(column_b),
+                        "correlation": float(value),
+                    }
+                )
+    pairs.sort(key=lambda pair: abs(pair["correlation"]), reverse=True)
+    return {"high_correlation_pairs": pairs[:20]}
+
+
+def _build_numeric_correlations(df: pd.DataFrame, target: str, target_series: pd.Series) -> list:
+    entries = []
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    for name in numeric_columns:
+        if name == target:
+            continue
+        value = df[name].corr(target_series)
+        if pd.isna(value):
+            continue
+        entries.append({"name": str(name), "correlation": float(value)})
+    entries.sort(key=lambda item: abs(item["correlation"]), reverse=True)
+    return entries
+
+
+def _build_categorical_group_differences(
+    df: pd.DataFrame, target: str, target_series: pd.Series, target_is_numeric: bool
+) -> list:
+    entries = []
+    categorical_columns = df.select_dtypes(include=["object", "category"]).columns
+    for name in categorical_columns:
+        if name == target:
+            continue
+        subset = df[[name, target]].dropna()
+        if subset.empty:
+            continue
+        group_means = []
+        for category, group_df in subset.groupby(name):
+            count = int(len(group_df))
+            if target_is_numeric:
+                mean_target = float(group_df[target].mean())
+            else:
+                top_value = group_df[target].mode().iloc[0]
+                mean_target = float((group_df[target] == top_value).mean())
+            group_means.append(
+                {"category": str(category), "mean_target": mean_target, "count": count}
+            )
+        entries.append({"name": str(name), "group_means": group_means})
+    return entries
+
+
+def _build_class_balance(target_series: pd.Series) -> dict | None:
+    if target_series.nunique(dropna=True) > 10:
+        return None
+    total = int(target_series.notna().sum())
+    classes = []
+    for value, count in target_series.value_counts(dropna=True).items():
+        value_out = value.item() if hasattr(value, "item") else value
+        classes.append(
+            {
+                "value": value_out,
+                "count": int(count),
+                "ratio": (int(count) / total) if total else 0.0,
+            }
+        )
+    return {"classes": classes}
+
+
+def _build_target_relationship(df: pd.DataFrame, target: str) -> dict:
+    target_series = df[target]
+    target_is_numeric = pd.api.types.is_numeric_dtype(target_series)
+
+    numeric_correlations = (
+        _build_numeric_correlations(df, target, target_series) if target_is_numeric else []
+    )
+    categorical_group_differences = _build_categorical_group_differences(
+        df, target, target_series, target_is_numeric
+    )
+
+    return {
+        "target": target,
+        "numeric_correlations": numeric_correlations,
+        "categorical_group_differences": categorical_group_differences,
+        "class_balance": _build_class_balance(target_series),
+    }
+
+
+def _build_time_pattern(
+    df: pd.DataFrame, time_column: str, target: str | None, parsed_time: pd.Series
+) -> dict:
+    target_is_numeric = target is not None and pd.api.types.is_numeric_dtype(df[target])
+    working = df.copy()
+    working["_analytica_parsed_time"] = parsed_time
+
+    monthly = []
+    month_key = working["_analytica_parsed_time"].dt.to_period("M").astype(str)
+    for month, group_df in working.groupby(month_key):
+        entry = {"month": month, "count": int(len(group_df))}
+        if target_is_numeric:
+            entry["mean_target"] = float(group_df[target].mean())
+        monthly.append(entry)
+    monthly.sort(key=lambda entry: entry["month"])
+
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_key = working["_analytica_parsed_time"].dt.day_name()
+    day_of_week = []
+    for day in day_names:
+        group_df = working[day_key == day]
+        if group_df.empty:
+            continue
+        entry = {"day": day, "count": int(len(group_df))}
+        if target_is_numeric:
+            entry["mean_target"] = float(group_df[target].mean())
+        day_of_week.append(entry)
+
+    return {"column": time_column, "monthly": monthly, "day_of_week": day_of_week}
+
+
 def profile_data(
     path: str,
     sample_threshold: int = DEFAULT_SAMPLE_THRESHOLD,
     key_columns: list[str] | None = None,
+    target: str | None = None,
+    time_column: str | None = None,
 ) -> dict:
     try:
         df, _encoding, _fmt = read_dataframe(path)
@@ -220,9 +370,34 @@ def profile_data(
                 "데이터에 실제로 존재하는 컬럼명을 지정하세요.",
             )
 
+    if target is not None and target not in df.columns:
+        return _error(
+            path,
+            f"target 컬럼이 데이터에 존재하지 않습니다: {target}",
+            "데이터에 실제로 존재하는 컬럼명을 target으로 지정하세요.",
+        )
+
+    parsed_time = None
+    if time_column is not None:
+        if time_column not in df.columns:
+            return _error(
+                path,
+                f"time_column이 데이터에 존재하지 않습니다: {time_column}",
+                "데이터에 실제로 존재하는 컬럼명을 time_column으로 지정하세요.",
+            )
+        try:
+            parsed_time = pd.to_datetime(df[time_column], errors="raise")
+        except (ValueError, TypeError):
+            return _error(
+                path,
+                f"{time_column} 컬럼을 날짜로 해석할 수 없습니다.",
+                "날짜로 해석할 수 없는 값이 포함되어 있습니다.",
+            )
+
     total_rows = df.shape[0]
     sampled = total_rows > sample_threshold
     analyzed = df.sample(n=sample_threshold, random_state=RANDOM_STATE) if sampled else df
+    analyzed_parsed_time = parsed_time.loc[analyzed.index] if parsed_time is not None else None
 
     return {
         "status": "ok",
@@ -235,6 +410,15 @@ def profile_data(
         "duplicates": _build_duplicates(analyzed, key_columns),
         "outliers": _build_outliers(analyzed),
         "categorical_issues": _build_categorical_issues(analyzed),
+        "correlation": _build_correlation(analyzed),
+        "target_relationship": (
+            _build_target_relationship(analyzed, target) if target is not None else None
+        ),
+        "time_pattern": (
+            _build_time_pattern(analyzed, time_column, target, analyzed_parsed_time)
+            if time_column is not None
+            else None
+        ),
     }
 
 
