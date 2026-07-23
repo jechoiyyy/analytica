@@ -36,6 +36,15 @@ SUPPORTED_SUFFIXES = {".csv": "csv", ".xlsx": "excel", ".xls": "excel", ".parque
 DEFAULT_SAMPLE_SIZE = 5
 
 
+class DataLoadError(Exception):
+    """지원하지 않는 형식, 파일 없음, 디코딩 실패 등 로드 실패 사유를 reason/hint로 전달한다."""
+
+    def __init__(self, reason: str, hint: str):
+        self.reason = reason
+        self.hint = hint
+        super().__init__(reason)
+
+
 def _error(path: str, reason: str, hint: str) -> dict:
     return {"status": "error", "path": path, "error": {"reason": reason, "hint": hint}}
 
@@ -57,12 +66,13 @@ def _to_sample(df: pd.DataFrame, sample_size: int) -> list:
     return json.loads(head.to_json(orient="records", force_ascii=False))
 
 
-def load_data(path: str, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict:
+def read_dataframe(path: str) -> tuple[pd.DataFrame, str | None, str]:
+    """파일을 로드해 (DataFrame, encoding_or_None, format) 을 반환한다.
+    format은 "csv"|"excel"|"parquet". 실패 시 DataLoadError를 발생시킨다."""
     file_path = Path(path)
 
     if not file_path.is_file():
-        return _error(
-            path,
+        raise DataLoadError(
             f"파일을 찾을 수 없습니다: {path}",
             "경로를 다시 확인하거나 파일이 존재하는지 확인하세요.",
         )
@@ -71,8 +81,7 @@ def load_data(path: str, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict:
     fmt = SUPPORTED_SUFFIXES.get(suffix)
     if fmt is None:
         supported = ", ".join(sorted(set(SUPPORTED_SUFFIXES.values())))
-        return _error(
-            path,
+        raise DataLoadError(
             f"지원하지 않는 파일 형식입니다: {suffix or '(확장자 없음)'}",
             f"지원 형식: {supported} (확장자: {', '.join(sorted(SUPPORTED_SUFFIXES))})",
         )
@@ -86,20 +95,29 @@ def load_data(path: str, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict:
         else:
             df = pd.read_parquet(file_path)
     except ImportError as exc:
-        return _error(
-            path,
+        raise DataLoadError(
             f"{fmt} 형식을 읽는 데 필요한 라이브러리가 없습니다: {exc}",
             "requirements-dev.txt의 의존성을 설치한 뒤 다시 시도하세요 "
             "(.venv/bin/python -m pip install -r requirements-dev.txt).",
-        )
+        ) from exc
     except ValueError as exc:
-        return _error(path, str(exc), "파일 인코딩을 확인하거나 원본 데이터를 다시 내보내세요.")
+        raise DataLoadError(
+            str(exc), "파일 인코딩을 확인하거나 원본 데이터를 다시 내보내세요."
+        ) from exc
     except Exception as exc:
-        return _error(
-            path,
+        raise DataLoadError(
             f"파일을 읽는 중 오류가 발생했습니다: {exc}",
             "파일이 손상되지 않았는지 확인하세요.",
-        )
+        ) from exc
+
+    return df, encoding, fmt
+
+
+def load_data(path: str, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict:
+    try:
+        df, encoding, fmt = read_dataframe(path)
+    except DataLoadError as exc:
+        return _error(path, exc.reason, exc.hint)
 
     columns = [{"name": str(name), "dtype": str(dtype)} for name, dtype in df.dtypes.items()]
 
