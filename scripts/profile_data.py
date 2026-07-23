@@ -437,11 +437,17 @@ def main(argv=None) -> int:
         default=None,
         help="중복 판단 기준이 되는 컬럼(쉼표로 구분)",
     )
+    parser.add_argument("--target", default=None, help="관계 분석에 사용할 타깃 컬럼")
+    parser.add_argument("--time-column", default=None, help="시간 패턴 분석에 사용할 날짜 컬럼")
     args = parser.parse_args(argv)
 
     key_columns = args.key_columns.split(",") if args.key_columns else None
     result = profile_data(
-        args.path, sample_threshold=args.sample_threshold, key_columns=key_columns
+        args.path,
+        sample_threshold=args.sample_threshold,
+        key_columns=key_columns,
+        target=args.target,
+        time_column=args.time_column,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "ok" else 1

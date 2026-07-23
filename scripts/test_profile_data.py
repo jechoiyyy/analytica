@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -205,6 +207,38 @@ def test_cli_accepts_key_columns_argument(tmp_path, capsys):
     assert exit_code == 0
     assert captured["duplicates"]["key_columns"] == ["id"]
     assert captured["duplicates"]["duplicate_key_count"] == 1
+
+
+def test_cli_accepts_target_and_time_column_arguments(tmp_path):
+    csv_path = tmp_path / "target_time.csv"
+    csv_path.write_text(
+        "date,target,feature\n"
+        "2024-01-01,0,1\n"
+        "2024-01-02,0,2\n"
+        "2024-02-01,1,8\n"
+        "2024-02-02,1,9\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(MODULE_PATH),
+            str(csv_path),
+            "--target",
+            "target",
+            "--time-column",
+            "date",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["target_relationship"]["target"] == "target"
+    assert result["time_pattern"]["column"] == "date"
 
 
 def test_correlation_high_pairs_detected_without_target(tmp_path):
