@@ -1,0 +1,6 @@
+pandas>=2.2,<3
+numpy>=1.26,<3
+openpyxl>=3.1,<4
+pyarrow>=15,<21
+matplotlib>=3.8,<4
+markdown>=3.6,<4
