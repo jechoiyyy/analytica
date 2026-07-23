@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "analytica",
+  "version": "0.1.0",
+  "description": "데이터 로드, 품질 진단, 전처리, 다음 단계 권고, 보고서 생성을 오케스트레이션하는 공용 분석 플러그인"
+}
