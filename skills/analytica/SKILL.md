@@ -63,8 +63,11 @@ status, path,
 shape {rows, columns},
 sampled, rows_analyzed,
 data_dictionary [{
-  name, dtype, non_null_count, null_count, null_ratio, n_unique, sample_values
+  name, dtype, non_null_count, null_count, null_ratio, n_unique, sample_values,
+  min, max, mean, std, skew
 }],
+high_cardinality_columns [{name, n_unique}],
+leakage_candidates [{name, reasons, correlation}],
 missing {
   overall_null_ratio, rows_with_any_null,
   by_column [{name, null_count, null_ratio}]
@@ -99,7 +102,7 @@ time_pattern {
 } | null
 ```
 
-실패 JSON은 `status`, `path`, `error {reason, hint}`이다. `correlation.high_correlation_pairs`는 절댓값이 0.9를 초과하는 상위 20쌍이다. `class_balance`는 타깃의 고유값이 10개 이하일 때만 만들어진다.
+실패 JSON은 `status`, `path`, `error {reason, hint}`이다. `correlation.high_correlation_pairs`는 절댓값이 0.9를 초과하는 상위 20쌍이다. `class_balance`는 타깃의 고유값이 10개 이하일 때만 만들어진다. `data_dictionary`의 `min|max|mean|std|skew`는 수치 컬럼에만 채워진다. `high_cardinality_columns`는 고유값이 50개를 초과해 범주 진단·그룹 차이 분석에서 제외된 식별자성 컬럼이며, `leakage_candidates`는 결정적 규칙(near-unique 식별자, 사후 결과 컬럼명 힌트, 타깃과 |상관| 0.8 이상)으로 뽑은 누출 후보다. `leakage_candidates`는 확정이 아니라 후보이므로 [3] 단계에서 근거와 함께 사용자에게 확인한다.
 
 ### `visualize.py`
 
@@ -235,7 +238,9 @@ status, out_path, embedded_charts, warnings
 1. `profile_data.py` CLI에 인터뷰에서 확정한 `--target`, `--time-column`, 필요하면 데이터 단위의 `--key-columns`를 전달한다.
 2. 50만 행을 초과해 `sampled=true`이면 `rows_analyzed`와 함께 샘플링 기반 결과임을 이후 보고서에 명시한다.
 3. 다음 JSON을 해석한다.
-   - `data_dictionary`: 타입, 고유값, 결측, 샘플값
+   - `data_dictionary`: 타입, 고유값, 결측, 샘플값, 수치 컬럼의 분포 통계(`min|max|mean|std|skew`). 회귀 타깃의 `skew` 절댓값이 크면 log1p 등 변환을 [4]에서 검토한다.
+   - `high_cardinality_columns`: 범주 분석에서 제외된 식별자성 컬럼. 이진·이산 수치 컬럼의 IQR 이상치 비율은 연속형 가정 산출물이므로 그대로 해석하지 않는다.
+   - `leakage_candidates`: 누출 후보. [3]에서 확정·기각한다.
    - `missing`: 전체 및 컬럼별 결측
    - `duplicates`: 전체 행과 키 기준 중복
    - `outliers`: IQR 및 z-score 이상치
@@ -248,9 +253,9 @@ status, out_path, embedded_charts, warnings
 
 ### [3] 누출 점검과 전처리 적용
 
-1. 누출 위험 후보를 자동 삭제하지 않는다. 먼저 근거와 함께 사용자에게 제시하고 제외 여부를 확인한다.
-2. `correlation.high_correlation_pairs`에서 타깃이 포함되고 절댓값 상관이 0.9를 초과하는 쌍, `target_relationship.numeric_correlations`의 고상관 변수는 타깃 파생 또는 사후 변수 가능성으로 경고한다.
-3. `data_dictionary`에서 고유값 비율이 거의 1인 컬럼과 인터뷰에서 식별자로 확인된 컬럼은 ID 누출 가능성으로 경고한다.
+1. 누출 위험 후보를 자동 삭제하지 않는다. 먼저 근거와 함께 사용자에게 제시하고 제외 여부를 확인한다. `leakage_candidates`를 출발점으로 삼되, 그것이 전부라고 가정하지 않고 아래 2~4를 함께 점검한다.
+2. `correlation.high_correlation_pairs`에서 타깃이 포함되고 절댓값 상관이 0.9를 초과하는 쌍, `target_relationship.numeric_correlations`의 고상관 변수는 타깃 파생 또는 사후 변수 가능성으로 경고한다. `leakage_candidates`의 `high_target_correlation`·`post_outcome_name_hint` 사유와 교차 확인한다.
+3. `data_dictionary`에서 고유값 비율이 거의 1인 컬럼, `leakage_candidates`의 `near_unique_identifier`, 인터뷰에서 식별자로 확인된 컬럼은 ID 누출 가능성으로 경고한다.
 4. 컬럼이 예측 시점 이후에만 생성되는지는 데이터만으로 확정하지 않는다. `[현업 확인 필요]`로 표시하고 예측 시점에 조회 가능한지 묻는다.
 5. 사용자 확인과 프로파일링 JSON에 따라 `plan.json`을 만든다.
    - 결측 대체·이상치 처리는 타입, 비율, 분포, 업무 의미를 근거로 선택한다.
@@ -338,6 +343,11 @@ HTML용 큐레이션 마크다운은 다음 순서로 작성한다.
    테스트셋 정책.
 7. 우선순위별 액션: 지금 결정할 것, 모델링 전 해결할 것, 이후 검증할 것.
 8. 한계와 확인사항: 주장하지 않는 내용, 미확정 사항, 다음 단계 차단 조건.
+9. 분석 진행 방식 요약: 인터뷰로 확정한 8개 항목을 표로 요약하고, 로드→
+   인터뷰→프로파일링→시각화→누출 점검·전처리→리포트 생성으로 이어지는
+   실행 파이프라인을 스크립트 단위로 간단히 나열한다. 전체 질의응답 맥락,
+   실행 명령·옵션, 이슈·결정 등록부 전체는 옮기지 않고 `report.md`의 해당
+   섹션(분석 계약, 이슈·결정 등록부, 재현성 manifest)을 참조하도록 안내한다.
 
 HTML에는 전체 데이터 사전을 포함하지 않는다. 도메인별 위험과 가설은 선택적
 블록으로 삽입하되 공통 골격을 대체하지 않는다. 발견을 직접 뒷받침하지 않는
@@ -350,7 +360,9 @@ HTML에는 전체 데이터 사전을 포함하지 않는다. 도메인별 위�
 2. `build_report.py`로 `analytica_output/<작업명>/report.html`을 생성하고
    `embedded_charts`와 `warnings`를 확인한다.
 3. `report.md`와 `report.html`의 분석 계약, 준비도, 핵심 수치, 처리 결정,
-   blocker 및 태그가 서로 모순되지 않는지 확인한다.
+   blocker 및 태그가 서로 모순되지 않는지 확인한다. 분석 진행 방식 요약의
+   인터뷰 확정 사항과 파이프라인 단계도 `report.md`의 분석 계약·재현성
+   manifest와 어긋나지 않는지 함께 확인한다.
 4. 모든 품질 상태, 준비도, 전처리 결정, 모델링 권고, 액션 제안에 신뢰도
    태그를 붙인다.
 5. 모든 전처리 변경이 이슈·결정 등록부에 연결되고 모든 미확정 항목이 현업

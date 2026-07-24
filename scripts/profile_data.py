@@ -15,7 +15,10 @@ JSON-호환 dict로 반환한다. 통계 계산만 수행하며 해석·서술�
   "rows_analyzed": int,
   "data_dictionary": [
     {"name": str, "dtype": str, "non_null_count": int, "null_count": int,
-     "null_ratio": float, "n_unique": int, "sample_values": [...]}
+     "null_ratio": float, "n_unique": int, "sample_values": [...],
+     # 수치 컬럼만: 분포 통계(전부 결측이면 각 값 null)
+     "min": float | null, "max": float | null, "mean": float | null,
+     "std": float | null, "skew": float | null}
   ],
   "missing": {
     "overall_null_ratio": float,
@@ -36,6 +39,12 @@ JSON-호환 dict로 반환한다. 통계 계산만 수행하며 해석·서술�
     {"name": str, "has_leading_trailing_whitespace": bool,
      "case_variant_groups": [[str, ...], ...],
      "rare_categories": [{"value": str, "count": int}]}
+  ],
+  # HIGH_CARDINALITY_LIMIT 초과로 범주 진단·그룹 차이에서 제외된 식별자성 컬럼
+  "high_cardinality_columns": [{"name": str, "n_unique": int}],
+  # 누출 후보(결정적 규칙 기반, 확정·기각은 LLM/인터뷰가 담당)
+  "leakage_candidates": [
+    {"name": str, "reasons": [str, ...], "correlation": float | null}
   ],
   "correlation": {
     "high_correlation_pairs": [
@@ -80,6 +89,24 @@ DEFAULT_SAMPLE_THRESHOLD = 500_000
 RANDOM_STATE = 42
 RARE_CATEGORY_RATIO = 0.01
 RARE_CATEGORY_MAX_COUNT = 5
+# 이 고유값 수를 넘는 object/category 컬럼은 식별자로 보고 범주 진단·그룹 차이에서 제외한다.
+HIGH_CARDINALITY_LIMIT = 50
+# 누출 자동 플래깅 임계값: 타깃과 |상관|이 이 값 이상이거나, 고유값 비율이 아래 값 이상이면 후보로 표시.
+LEAKAGE_CORR_THRESHOLD = 0.8
+NEAR_UNIQUE_RATIO = 0.98
+# 예측 시점 이후에 생성될 가능성을 시사하는 컬럼명 힌트(사후 결과 변수).
+LEAKAGE_NAME_HINTS = (
+    "after",
+    "post_",
+    "_post",
+    "refund",
+    "review",
+    "outcome",
+    "resolved",
+    "settled",
+    "chargeback",
+    "_actual",
+)
 
 
 def _error(path: str, reason: str, hint: str) -> dict:
@@ -90,6 +117,26 @@ def _sample_values(series: pd.Series, limit: int = 3) -> list:
     return series.dropna().head(limit).tolist()
 
 
+def _num_or_none(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _numeric_stats(column: pd.Series) -> dict:
+    """수치 컬럼의 분포 통계. 전부 결측이거나 계산 불가면 None을 반환한다."""
+    clean = column.dropna()
+    if clean.empty:
+        return {"min": None, "max": None, "mean": None, "std": None, "skew": None}
+    return {
+        "min": _num_or_none(clean.min()),
+        "max": _num_or_none(clean.max()),
+        "mean": _num_or_none(clean.mean()),
+        "std": _num_or_none(clean.std()),
+        "skew": _num_or_none(clean.skew()),
+    }
+
+
 def _build_data_dictionary(df: pd.DataFrame) -> list:
     entries = []
     for name in df.columns:
@@ -97,17 +144,36 @@ def _build_data_dictionary(df: pd.DataFrame) -> list:
         non_null_count = int(column.notna().sum())
         null_count = int(column.isna().sum())
         total = len(column)
-        entries.append(
-            {
-                "name": str(name),
-                "dtype": str(column.dtype),
-                "non_null_count": non_null_count,
-                "null_count": null_count,
-                "null_ratio": (null_count / total) if total else 0.0,
-                "n_unique": int(column.nunique(dropna=True)),
-                "sample_values": _sample_values(column),
-            }
-        )
+        entry = {
+            "name": str(name),
+            "dtype": str(column.dtype),
+            "non_null_count": non_null_count,
+            "null_count": null_count,
+            "null_ratio": (null_count / total) if total else 0.0,
+            "n_unique": int(column.nunique(dropna=True)),
+            "sample_values": _sample_values(column),
+        }
+        if pd.api.types.is_numeric_dtype(column):
+            entry.update(_numeric_stats(column))
+        entries.append(entry)
+    return entries
+
+
+def _high_cardinality_names(df: pd.DataFrame) -> set:
+    """식별자로 볼 만한 고카디널리티 object/category 컬럼명 집합."""
+    names = set()
+    for name in df.select_dtypes(include=["object", "category"]).columns:
+        if df[name].nunique(dropna=True) > HIGH_CARDINALITY_LIMIT:
+            names.add(name)
+    return names
+
+
+def _build_high_cardinality_columns(df: pd.DataFrame) -> list:
+    entries = []
+    for name in df.select_dtypes(include=["object", "category"]).columns:
+        n_unique = int(df[name].nunique(dropna=True))
+        if n_unique > HIGH_CARDINALITY_LIMIT:
+            entries.append({"name": str(name), "n_unique": n_unique})
     return entries
 
 
@@ -199,10 +265,12 @@ def _rare_categories(values: pd.Series) -> list:
     return [{"value": str(value), "count": int(count)} for value, count in rare.items()]
 
 
-def _build_categorical_issues(df: pd.DataFrame) -> list:
+def _build_categorical_issues(df: pd.DataFrame, skip_columns: set = frozenset()) -> list:
     entries = []
     categorical_columns = df.select_dtypes(include=["object", "category"]).columns
     for name in categorical_columns:
+        if name in skip_columns:
+            continue
         column = df[name]
         string_values = column.dropna().apply(lambda v: isinstance(v, str))
         has_whitespace = bool(
@@ -257,12 +325,16 @@ def _build_numeric_correlations(df: pd.DataFrame, target: str, target_series: pd
 
 
 def _build_categorical_group_differences(
-    df: pd.DataFrame, target: str, target_series: pd.Series, target_is_numeric: bool
+    df: pd.DataFrame,
+    target: str,
+    target_series: pd.Series,
+    target_is_numeric: bool,
+    skip_columns: set = frozenset(),
 ) -> list:
     entries = []
     categorical_columns = df.select_dtypes(include=["object", "category"]).columns
     for name in categorical_columns:
-        if name == target:
+        if name == target or name in skip_columns:
             continue
         subset = df[[name, target]].dropna()
         if subset.empty:
@@ -299,7 +371,9 @@ def _build_class_balance(target_series: pd.Series) -> dict | None:
     return {"classes": classes}
 
 
-def _build_target_relationship(df: pd.DataFrame, target: str) -> dict:
+def _build_target_relationship(
+    df: pd.DataFrame, target: str, skip_columns: set = frozenset()
+) -> dict:
     target_series = df[target]
     target_is_numeric = pd.api.types.is_numeric_dtype(target_series)
 
@@ -307,7 +381,7 @@ def _build_target_relationship(df: pd.DataFrame, target: str) -> dict:
         _build_numeric_correlations(df, target, target_series) if target_is_numeric else []
     )
     categorical_group_differences = _build_categorical_group_differences(
-        df, target, target_series, target_is_numeric
+        df, target, target_series, target_is_numeric, skip_columns
     )
 
     return {
@@ -316,6 +390,53 @@ def _build_target_relationship(df: pd.DataFrame, target: str) -> dict:
         "categorical_group_differences": categorical_group_differences,
         "class_balance": _build_class_balance(target_series),
     }
+
+
+def _build_leakage_candidates(df: pd.DataFrame, target: str | None) -> list:
+    """누출 후보를 결정적 규칙으로 플래깅한다(확정·기각은 LLM/인터뷰가 담당).
+
+    - near_unique_identifier: 비-실수형 컬럼의 고유값 비율이 NEAR_UNIQUE_RATIO 이상 (ID 암기 위험)
+    - post_outcome_name_hint: 컬럼명이 사후 결과를 시사 (LEAKAGE_NAME_HINTS)
+    - high_target_correlation: 수치 타깃과 |상관|이 LEAKAGE_CORR_THRESHOLD 이상
+    """
+    n_rows = len(df)
+    target_series = df[target] if target is not None and target in df.columns else None
+    target_is_numeric = target_series is not None and pd.api.types.is_numeric_dtype(target_series)
+
+    candidates: dict[str, dict] = {}
+
+    def _add(name, reason, correlation=None):
+        entry = candidates.setdefault(
+            str(name), {"name": str(name), "reasons": [], "correlation": None}
+        )
+        if reason not in entry["reasons"]:
+            entry["reasons"].append(reason)
+        if correlation is not None:
+            entry["correlation"] = correlation
+
+    for name in df.columns:
+        if target is not None and name == target:
+            continue
+        column = df[name]
+        if (
+            n_rows
+            and not pd.api.types.is_float_dtype(column)
+            and column.nunique(dropna=True) / n_rows >= NEAR_UNIQUE_RATIO
+        ):
+            _add(name, "near_unique_identifier")
+        lowered = str(name).lower()
+        if any(hint in lowered for hint in LEAKAGE_NAME_HINTS):
+            _add(name, "post_outcome_name_hint")
+
+    if target_is_numeric:
+        for name in df.select_dtypes(include=[np.number]).columns:
+            if name == target:
+                continue
+            value = df[name].corr(target_series)
+            if pd.notna(value) and abs(value) >= LEAKAGE_CORR_THRESHOLD:
+                _add(name, "high_target_correlation", float(value))
+
+    return list(candidates.values())
 
 
 def _build_time_pattern(
@@ -399,6 +520,8 @@ def profile_data(
     analyzed = df.sample(n=sample_threshold, random_state=RANDOM_STATE) if sampled else df
     analyzed_parsed_time = parsed_time.loc[analyzed.index] if parsed_time is not None else None
 
+    high_card_names = _high_cardinality_names(analyzed)
+
     return {
         "status": "ok",
         "path": path,
@@ -409,10 +532,14 @@ def profile_data(
         "missing": _build_missing(analyzed),
         "duplicates": _build_duplicates(analyzed, key_columns),
         "outliers": _build_outliers(analyzed),
-        "categorical_issues": _build_categorical_issues(analyzed),
+        "categorical_issues": _build_categorical_issues(analyzed, high_card_names),
+        "high_cardinality_columns": _build_high_cardinality_columns(analyzed),
+        "leakage_candidates": _build_leakage_candidates(analyzed, target),
         "correlation": _build_correlation(analyzed),
         "target_relationship": (
-            _build_target_relationship(analyzed, target) if target is not None else None
+            _build_target_relationship(analyzed, target, high_card_names)
+            if target is not None
+            else None
         ),
         "time_pattern": (
             _build_time_pattern(analyzed, time_column, target, analyzed_parsed_time)
