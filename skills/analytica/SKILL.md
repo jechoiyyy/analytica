@@ -48,13 +48,19 @@ sample [{<column>: <value>}]
   [--sample-threshold <int>] \
   [--key-columns <column1,column2,...>] \
   [--target <column>] \
-  [--time-column <column>]
+  [--time-column <column>] \
+  [--positive-class <value>] \
+  [--multiclass-limit <int>] \
+  [--min-association-sample <int>]
 ```
 
 - `--sample-threshold`: 이 행 수를 초과하면 고정 난수 42로 샘플링한다. 기본값 500000
 - `--key-columns`: 중복 키를 판단할 컬럼의 쉼표 구분 목록
 - `--target`: 타깃 관계와 클래스 균형을 분석할 컬럼
 - `--time-column`: 월별·요일별 시간 패턴을 분석할 날짜 컬럼
+- `--positive-class`: 이진 타깃에서 양성으로 볼 값. 생략하면 자동 판별한다
+- `--multiclass-limit`: 이 고유값 수 이하의 비연속 타깃을 다중분류로 본다. 기본값 20
+- `--min-association-sample`: 연관도 계산에 필요한 최소 유효 표본. 기본값 30
 
 성공 JSON:
 
@@ -67,7 +73,7 @@ data_dictionary [{
   min, max, mean, std, skew
 }],
 high_cardinality_columns [{name, n_unique}],
-leakage_candidates [{name, reasons, correlation}],
+leakage_candidates [{name, reasons, signal, association}],
 missing {
   overall_null_ratio, rows_with_any_null,
   by_column [{name, null_count, null_ratio}]
@@ -88,21 +94,56 @@ correlation {
   high_correlation_pairs [{column_a, column_b, correlation}]
 },
 target_relationship {
-  target,
-  numeric_correlations [{name, correlation}],
+  target, target_type, positive_class, positive_class_rule,
+  baseline {stat, value} | null,
+  numeric_associations [{name, metric, value, strength, direction, pearson?, n}],
+  numeric_columns_skipped [name],
+  categorical_associations [{name, metric, value, strength}],
   categorical_group_differences [{
-    name, group_means [{category, mean_target, count}]
+    name, stat, groups [{category, count, value} | {category, count, distribution}]
   }],
-  class_balance {classes [{value, count, ratio}]} | null
+  class_balance {classes [{value, count, ratio}], imbalance_ratio} | null
 } | null,
 time_pattern {
-  column,
-  monthly [{month, count, mean_target?}],
-  day_of_week [{day, count, mean_target?}]
+  column, stat,
+  monthly [{month, count, value?}],
+  day_of_week [{day, count, value?}]
 } | null
 ```
 
-실패 JSON은 `status`, `path`, `error {reason, hint}`이다. `correlation.high_correlation_pairs`는 절댓값이 0.9를 초과하는 상위 20쌍이다. `class_balance`는 타깃의 고유값이 10개 이하일 때만 만들어진다. `data_dictionary`의 `min|max|mean|std|skew`는 수치 컬럼에만 채워진다. `high_cardinality_columns`는 고유값이 50개를 초과해 범주 진단·그룹 차이 분석에서 제외된 식별자성 컬럼이며, `leakage_candidates`는 결정적 규칙(near-unique 식별자, 사후 결과 컬럼명 힌트, 타깃과 |상관| 0.8 이상)으로 뽑은 누출 후보다. `leakage_candidates`는 확정이 아니라 후보이므로 [3] 단계에서 근거와 함께 사용자에게 확인한다.
+실패 JSON은 `status`, `path`, `error {reason, hint}`이다. `correlation.high_correlation_pairs`는 절댓값이 0.9를 초과하는 상위 20쌍이다. `data_dictionary`의 `min|max|mean|std|skew`는 수치 컬럼에만 채워진다. `high_cardinality_columns`는 고유값이 50개를 초과해 범주 진단·그룹 차이 분석에서 제외된 식별자성 컬럼이다.
+
+#### 타깃 타입과 연관도 지표
+
+`target_type`은 dtype이 아니라 고유값 수로 판별하므로 `"Yes"/"No"` 같은 문자열 타깃도 이진으로 정상 분석된다. 지표는 타입마다 다르지만 한 실행 안에서는 하나로 고정되므로 `strength` 기준 순위 비교가 안전하다.
+
+| target_type | 판별 기준 | 수치 특성 지표 | 범주 특성 지표 |
+|---|---|---|---|
+| `binary` | 고유값 2개 (dtype 무관) | `auc` | `cramers_v` |
+| `multiclass` | 정수형 또는 문자열이고 고유값이 `--multiclass-limit` 이하 | `eta_squared` | `cramers_v` |
+| `continuous` | 수치형이고 고유값이 많음 | `spearman` (`pearson` 병기) | `eta_squared` |
+| `degenerate` | 고유값 1개 이하 | 분석 없음 | 분석 없음 |
+| `high_cardinality_label` | 문자열이고 고유값이 한도 초과 | 분석 없음 | 분석 없음 |
+
+- **`value`와 `strength`를 반드시 구분해 서술한다.** `value`는 지표 원값이라 방향을 담고, `strength`는 0~1로 정규화한 신호 세기다. 예를 들어 `auc=0.2`는 약한 관계가 아니라 **강한 음의 관계**(`strength=0.6`, `direction="negative"`)다. 순위·상위 N 선정은 항상 `strength`로 한다.
+- `spearman`은 순위 기반이므로 **단조 비선형 관계**도 잡는다. `pearson`과 크게 차이 나면 관계가 비선형임을 시사하니 [4]에서 변환을 검토한다.
+- `direction`이 `null`인 지표(`eta_squared`)는 방향이 정의되지 않으므로 "높을수록/낮을수록"으로 서술하지 않는다.
+- `numeric_columns_skipped`는 유효 표본 부족·상수 컬럼 등으로 연관도를 계산하지 못한 컬럼이다. 관계가 없다는 뜻이 아니므로 "관계 없음"으로 서술하지 않는다.
+- `categorical_group_differences`의 `stat`이 `class_distribution`이면 각 그룹은 스칼라 대신 상위 클래스 분포를 갖는다. 이때 그룹 간 크기 비교를 하지 않는다.
+- `baseline`은 전체 기준값이다. 그룹 차이를 서술할 때 이 값과 비교해 배수를 제시한다.
+
+#### positive_class 확인
+
+`target_type`이 `binary`면 `positive_class`(양성으로 코드화한 값)와 `positive_class_rule`(결정 규칙)이 함께 온다. 규칙은 `numeric_convention`(0/1), `boolean_convention`(False/True), `minority_class`(소수 클래스), `tie_broken_by_sort`(동률), `user_specified` 중 하나다.
+
+**`minority_class`나 `tie_broken_by_sort`로 결정된 경우 [3] 단계에서 사용자에게 확인한다.** 업무상 관심 사건과 다르면 `--positive-class`로 다시 실행한다. 관심 사건이 뒤집히면 `direction`, `baseline`, 그룹별 `positive_rate`가 모두 반대로 읽힌다.
+
+#### 누출 후보
+
+`leakage_candidates`는 결정적 규칙으로 뽑은 후보이며 확정이 아니므로 [3] 단계에서 근거와 함께 사용자에게 확인한다. `signal`은 신뢰도다.
+
+- `strong`: 구조에서 나온 신호. `near_unique_identifier`(고유값 비율 0.98 이상), `near_perfect_target_separation`(타깃 연관도 `strength` 0.8 이상)
+- `weak`: `post_outcome_name_hint`. 컬럼명 문자열 매칭이라 도메인·언어에 따라 오탐이 잦다. 이 사유만 있는 컬럼은 누출로 단정하지 말고 컬럼의 실제 의미를 먼저 확인한다.
 
 ### `visualize.py`
 
@@ -237,7 +278,8 @@ status, out_path, embedded_charts, warnings
 
 1. `profile_data.py` CLI에 인터뷰에서 확정한 `--target`, `--time-column`, 필요하면 데이터 단위의 `--key-columns`를 전달한다.
 2. 50만 행을 초과해 `sampled=true`이면 `rows_analyzed`와 함께 샘플링 기반 결과임을 이후 보고서에 명시한다.
-3. 다음 JSON을 해석한다.
+3. `target_relationship.target_type`을 가장 먼저 확인한다. 인터뷰에서 확정한 분석 목적과 어긋나면(예: 분류라고 했는데 `continuous`) 진행 전에 사용자에게 확인한다. `degenerate`나 `high_cardinality_label`이면 해당 컬럼은 타깃으로 쓸 수 없으므로 타깃을 다시 정한다.
+4. 다음 JSON을 해석한다.
    - `data_dictionary`: 타입, 고유값, 결측, 샘플값, 수치 컬럼의 분포 통계(`min|max|mean|std|skew`). 회귀 타깃의 `skew` 절댓값이 크면 log1p 등 변환을 [4]에서 검토한다.
    - `high_cardinality_columns`: 범주 분석에서 제외된 식별자성 컬럼. 이진·이산 수치 컬럼의 IQR 이상치 비율은 연속형 가정 산출물이므로 그대로 해석하지 않는다.
    - `leakage_candidates`: 누출 후보. [3]에서 확정·기각한다.
@@ -245,16 +287,17 @@ status, out_path, embedded_charts, warnings
    - `duplicates`: 전체 행과 키 기준 중복
    - `outliers`: IQR 및 z-score 이상치
    - `categorical_issues`: 공백, 대소문자 변형, 희귀 범주
-   - `correlation`: 강한 수치 상관
-   - `target_relationship`: 타깃 상관, 범주 그룹 차이, 클래스 균형
-   - `time_pattern`: 월별·요일별 건수와 수치 타깃 평균
-4. 결과를 근거로 `visualize.py`에 타깃, 시간, 주요 수치 컬럼만 지정한다. 모든 컬럼을 기계적으로 그리지 않는다.
-5. 차트는 `analytica_output/<작업명>/figures/`에 생성한다. 경고가 있으면 누락된 차트와 이유를 기록하고 나머지 결과를 사용한다.
+   - `correlation`: 특성 간 강한 상관(다중공선성). 타깃 관계는 `target_relationship`을 쓴다
+   - `target_relationship`: 타깃 타입, 연관도, 범주 그룹 차이, 클래스 균형. 위 "타깃 타입과 연관도 지표" 절의 서술 규칙을 따른다
+   - `time_pattern`: 월별·요일별 건수와 `stat` 기준 타깃 요약
+5. 결과를 근거로 `visualize.py`에 타깃, 시간, 주요 수치 컬럼만 지정한다. 모든 컬럼을 기계적으로 그리지 않는다. 히스토그램·박스플롯 대상은 `numeric_associations`의 `strength` 상위 컬럼에서 고른다.
+6. 차트는 `analytica_output/<작업명>/figures/`에 생성한다. 경고가 있으면 누락된 차트와 이유를 기록하고 나머지 결과를 사용한다.
 
 ### [3] 누출 점검과 전처리 적용
 
 1. 누출 위험 후보를 자동 삭제하지 않는다. 먼저 근거와 함께 사용자에게 제시하고 제외 여부를 확인한다. `leakage_candidates`를 출발점으로 삼되, 그것이 전부라고 가정하지 않고 아래 2~4를 함께 점검한다.
-2. `correlation.high_correlation_pairs`에서 타깃이 포함되고 절댓값 상관이 0.9를 초과하는 쌍, `target_relationship.numeric_correlations`의 고상관 변수는 타깃 파생 또는 사후 변수 가능성으로 경고한다. `leakage_candidates`의 `high_target_correlation`·`post_outcome_name_hint` 사유와 교차 확인한다.
+2. `correlation.high_correlation_pairs`에서 타깃이 포함되고 절댓값 상관이 0.9를 초과하는 쌍, `target_relationship.numeric_associations`·`categorical_associations`에서 `strength`가 높은 변수는 타깃 파생 또는 사후 변수 가능성으로 경고한다. `leakage_candidates`의 `near_perfect_target_separation`·`post_outcome_name_hint` 사유와 교차 확인하되, `signal`이 `weak`인 후보(이름 매칭)는 컬럼의 실제 의미를 먼저 확인하고 단정하지 않는다.
+   또한 `target_type`이 `binary`이고 `positive_class_rule`이 `minority_class`·`tie_broken_by_sort`이면, 자동 판별한 양성 클래스가 업무상 관심 사건과 일치하는지 이 단계에서 함께 확인한다.
 3. `data_dictionary`에서 고유값 비율이 거의 1인 컬럼, `leakage_candidates`의 `near_unique_identifier`, 인터뷰에서 식별자로 확인된 컬럼은 ID 누출 가능성으로 경고한다.
 4. 컬럼이 예측 시점 이후에만 생성되는지는 데이터만으로 확정하지 않는다. `[현업 확인 필요]`로 표시하고 예측 시점에 조회 가능한지 묻는다.
 5. 사용자 확인과 프로파일링 JSON에 따라 `plan.json`을 만든다.
@@ -275,9 +318,10 @@ status, out_path, embedded_charts, warnings
 - 미래 예측이고 시간 컬럼이 있으면 과거 학습/미래 평가와 `TimeSeriesSplit`을 우선 검토한다.
 - 고객·매장·상품처럼 같은 그룹이 양쪽 split에 들어가면 안 되면 그룹 기준 분리와 `GroupKFold` 계열을 권고한다.
 - 그 외에는 랜덤 분리를 검토한다.
-- 분류이며 `target_relationship.class_balance`가 있으면 split에 stratify를 적용하고 `StratifiedKFold`를 검토한다.
-- 회귀 baseline은 단순 기준값, 선형회귀, 얕은 트리부터 제안하고 MAE/RMSE/R² 중 업무 비용과 해석에 맞는 지표를 권고한다.
-- 분류 baseline은 다수 클래스 기준, 로지스틱 회귀, 얕은 트리부터 제안한다. 불균형이면 Accuracy만 사용하지 말고 PR-AUC, Recall, F1을 중심으로 권고한다.
+- `target_type`이 `binary`·`multiclass`면 split에 stratify를 적용하고 `StratifiedKFold`를 검토한다. 불균형 정도는 `class_balance.imbalance_ratio`로 판단한다.
+- 회귀(`continuous`) baseline은 단순 기준값, 선형회귀, 얕은 트리부터 제안하고 MAE/RMSE/R² 중 업무 비용과 해석에 맞는 지표를 권고한다. `numeric_associations`에서 `spearman`과 `pearson`이 크게 다르면 비선형 관계이므로 변환이나 트리 계열을 함께 권고한다.
+- 분류 baseline은 다수 클래스 기준, 로지스틱 회귀, 얕은 트리부터 제안한다. 불균형이면 Accuracy만 사용하지 말고 PR-AUC, Recall, F1을 중심으로 권고한다. 이때 PR-AUC·Recall이 어느 클래스 기준인지 `positive_class`를 명시한다.
+- 이진 타깃의 `numeric_associations` AUC는 **단일 변수** 기준값이므로 모델 성능 예측치로 서술하지 않는다.
 - 군집은 스케일링 후 단순 군집 후보와 Silhouette, Davies-Bouldin, Calinski-Harabasz를 권고하되 이 단계에서는 실행하지 않는다.
 - 테스트셋은 최종 평가를 위해 봉인하고 튜닝에 반복 사용하지 말라고 명시한다.
 
