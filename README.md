@@ -104,6 +104,12 @@ analytica_output/<작업명>/
 
 성공하면 표준 출력 JSON의 `status`가 `ok`로 표시됩니다.
 
+스크립트의 계산 로직은 `analytica/tests/`에 테스트가 있습니다.
+
+```bash
+.venv/bin/python -m pytest analytica/tests/ -q
+```
+
 ## 업데이트
 
 ```bash
